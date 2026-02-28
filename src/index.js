@@ -9,11 +9,11 @@ const { ClusterClient } = require('discord-hybrid-sharding');
 const client = new Client({
     intents: [
         "Guilds",
-        "GuildMembers",
+        // "GuildMembers",
         "GuildMessages",
         "GuildMessageReactions",
         "DirectMessages",
-        "MessageContent",
+        // "MessageContent",
         "GuildVoiceStates",
     ],
     partials: [

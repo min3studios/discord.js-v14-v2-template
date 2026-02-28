@@ -51,6 +51,15 @@ module.exports = async () => {
 
     const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
     try {
+        // Fetch existing commands to preserve Entry Point command
+        const existingCommands = await rest.get(Routes.applicationCommands(process.env.CLIENTID));
+        const entryPointCommand = existingCommands.find(cmd => cmd.type === 4); // Type 4 is Primary Entry Point
+
+        if (entryPointCommand) {
+            console.log(colors.yellow(`Found Entry Point command: ${entryPointCommand.name}, preserving it.`));
+            slash.push(entryPointCommand);
+        }
+
         await rest.put(
             Routes.applicationCommands(process.env.CLIENTID),
             { body: slash }
