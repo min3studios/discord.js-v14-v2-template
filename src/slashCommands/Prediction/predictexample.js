@@ -15,7 +15,7 @@ module.exports = {
                 { name: 'Transaction Size', value: '3,534.12 shares', inline: true },
                 { name: 'Transaction Value', value: '$3,498.66', inline: true }
             )
-            .setFooter({ text: 'Polymarket Alert • Powered by Onsight' })
+            .setFooter({ text: 'Polymarket Alert • Powered by CordEx' })
             .setTimestamp();
 
         const row = new ActionRowBuilder()

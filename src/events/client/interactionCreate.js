@@ -36,6 +36,9 @@ module.exports = {
 
                 if (customId === 'copy_trade') {
                     const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+                    
+                    // Dummy balance for display
+                    const dummyBalance = 10000;
 
                     const row1 = new ActionRowBuilder()
                         .addComponents(
@@ -54,7 +57,7 @@ module.exports = {
                         );
 
                     await interaction.reply({
-                        content: 'Select the percentage of your balance you would like to trade:',
+                        content: `**Current Balance:** $${dummyBalance.toLocaleString()}\nSelect the percentage of your balance you would like to trade:`,
                         components: [row1, row2],
                         flags: MessageFlags.Ephemeral
                     });
