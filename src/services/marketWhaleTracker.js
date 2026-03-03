@@ -233,6 +233,10 @@ class MarketWhaleTracker {
 
             // Outcome formatting
             const outcomeText = outcomeLabel ? `(${outcomeLabel})` : '';
+            
+            // Time formatting (Discord Relative Timestamp)
+            const tradeTimestamp = Math.floor(trade.timestamp); // Ensure it's in seconds
+            const timeField = `<t:${tradeTimestamp}:R>`; // e.g. "2 minutes ago"
 
             const embed = new EmbedBuilder()
                 .setTitle('🐋 WHALE ALERT')
@@ -241,7 +245,8 @@ class MarketWhaleTracker {
                 .addFields(
                     { name: 'Price', value: priceStr, inline: true },
                     { name: 'Size', value: `${sizeStr} shares`, inline: true },
-                    { name: 'Value', value: valueStr, inline: true }
+                    { name: 'Value', value: valueStr, inline: true },
+                    { name: 'Time', value: timeField, inline: true }
                 )
                 .setFooter({ text: 'Polymarket Whale Alert • Powered by CordEx' })
                 .setTimestamp(new Date(trade.timestamp * 1000));
