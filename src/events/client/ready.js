@@ -1,9 +1,10 @@
 const { ActivityType } = require('discord.js');
+const PolymarketTracker = require('../../services/polymarketTracker');
 
 module.exports = {
     name: 'clientReady',
     once: true,
-    execute(client) {
+    async execute(client) {
         const tag = client.user.tag;
         const boxTitle = `BOT READY`;
         const boxMessage = `Logged in as ${tag}`;
@@ -21,5 +22,9 @@ module.exports = {
                 type: ActivityType.Custom,
             }],
         });
+
+        // Start Polymarket Tracker
+        const tracker = new PolymarketTracker(client);
+        await tracker.start();
     },
 };
