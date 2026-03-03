@@ -1,5 +1,6 @@
 const { ActivityType } = require('discord.js');
 const PolymarketTracker = require('../../services/polymarketTracker');
+const MarketWhaleTracker = require('../../services/marketWhaleTracker');
 
 module.exports = {
     name: 'clientReady',
@@ -24,7 +25,11 @@ module.exports = {
         });
 
         // Start Polymarket Tracker
-        const tracker = new PolymarketTracker(client);
-        await tracker.start();
+        // const tracker = new PolymarketTracker(client);
+        // await tracker.start();
+
+        // Start Whale Tracker
+        const whaleTracker = new MarketWhaleTracker(client);
+        await whaleTracker.start();
     },
 };

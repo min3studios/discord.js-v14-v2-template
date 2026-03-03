@@ -81,7 +81,6 @@ class PolymarketTracker {
 
     async scanTrades() {
         try {
-            console.log('[PolymarketTracker] Scanning for new trades...');
             const response = await this.dataApi.get('/trades', {
                 params: {
                     limit: 50, // Get last 50 trades
@@ -95,16 +94,17 @@ class PolymarketTracker {
                 return;
             }
 
-            console.log(`[PolymarketTracker] Fetched ${trades.length} trades. Processing...`);
-
             const now = Date.now();
             const TWO_MINUTES = 2 * 60 * 1000;
+            let skippedRecency = 0;
+            let matchesFound = 0;
 
             // Process trades from oldest to newest to maintain order
             const newTrades = trades.reverse().filter(trade => {
                 // Check recency (within 2 minutes)
                 const tradeTime = trade.timestamp * 1000;
                 if (now - tradeTime > TWO_MINUTES) {
+                    skippedRecency++;
                     return false;
                 }
 
@@ -126,16 +126,15 @@ class PolymarketTracker {
                 
                 const isMatch = this.topTraders.has(maker) || this.topTraders.has(taker);
                 if (isMatch) {
-                    console.log(`[PolymarketTracker] Match found! Trader: ${this.topTraders.has(taker) ? taker : maker}`);
+                    matchesFound++;
+                    const matchedAddr = this.topTraders.has(taker) ? taker : maker;
+                    const value = (parseFloat(trade.size) * parseFloat(trade.price)).toFixed(2);
+                    console.log(`[PolymarketTracker] 🎯 Match! Trader: ${matchedAddr.slice(0,6)}... | Value: $${value} | Side: ${trade.side}`);
                 }
                 return isMatch;
             });
 
-            if (newTrades.length === 0) {
-                console.log('[PolymarketTracker] No new matching trades found in this scan.');
-            } else {
-                console.log(`[PolymarketTracker] Found ${newTrades.length} new matching trades. Posting alerts...`);
-            }
+            console.log(`[PolymarketTracker] Scanned ${trades.length} trades. Ignored (old): ${skippedRecency}. Matches: ${matchesFound}.`);
 
             for (const trade of newTrades) {
                 await this.postTradeAlert(trade);
