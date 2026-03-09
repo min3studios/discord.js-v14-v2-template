@@ -25,8 +25,8 @@ module.exports = {
         });
 
         // Start Polymarket Tracker
-        // const tracker = new PolymarketTracker(client);
-        // await tracker.start();
+        const tracker = new PolymarketTracker(client);
+        await tracker.start();
 
         // Start Whale Tracker
         const whaleTracker = new MarketWhaleTracker(client);

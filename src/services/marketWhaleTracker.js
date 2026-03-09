@@ -11,7 +11,7 @@ class MarketWhaleTracker {
         // Configuration
         this.threshold = parseFloat(process.env.WHALE_ALERT_THRESHOLD || '1000'); // Increased default to avoid spam if scanning all
         this.targetGuildId = process.env.TARGET_GUILD_ID;
-        this.targetChannelId = process.env.TARGET_CHANNEL_ID;
+        this.targetChannelId = process.env.WHALE_CHANNEL_ID;
         
         // Cache for market metadata (AssetID -> { title, image, ... })
         this.marketCache = new Map();
