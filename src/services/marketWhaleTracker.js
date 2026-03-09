@@ -7,62 +7,115 @@ class MarketWhaleTracker {
         this.client = client;
         this.processedTradeIds = new Set();
         this.isScanning = false;
-        
-        // Configuration
-        this.threshold = parseFloat(process.env.WHALE_ALERT_THRESHOLD || '1000'); // Increased default to avoid spam if scanning all
+
+        this.threshold = parseFloat(process.env.WHALE_ALERT_THRESHOLD || '1000');
         this.targetGuildId = process.env.TARGET_GUILD_ID;
         this.targetChannelId = process.env.WHALE_CHANNEL_ID;
-        
-        // Cache for market metadata (AssetID -> { title, image, ... })
-        this.marketCache = new Map();
+        this.pollIntervalMs = parseInt(process.env.WHALE_POLL_INTERVAL_MS || '1500', 10);
+        this.tradeFetchLimit = parseInt(process.env.WHALE_TRADE_FETCH_LIMIT || '200', 10);
+        this.maxPagesPerPoll = parseInt(process.env.WHALE_MAX_PAGES_PER_POLL || '3', 10);
+        this.maxTradesPerPoll = parseInt(process.env.WHALE_MAX_TRADES_PER_POLL || '600', 10);
+        this.alertConcurrency = parseInt(process.env.WHALE_ALERT_CONCURRENCY || '3', 10);
+        this.apiTimeoutMs = parseInt(process.env.POLY_API_TIMEOUT_MS || '9000', 10);
+        this.maxRetryAttempts = parseInt(process.env.POLY_API_RETRY_ATTEMPTS || '3', 10);
+        this.cacheRefreshMs = parseInt(process.env.WHALE_CACHE_REFRESH_MS || `${10 * 60 * 1000}`, 10);
+        this.statsLogIntervalMs = parseInt(process.env.WHALE_STATS_LOG_INTERVAL_MS || '60000', 10);
 
-        // API Clients
+        this.marketCache = new Map();
+        this.stats = {
+            polls: 0,
+            tradesFetched: 0,
+            candidates: 0,
+            alertsSent: 0,
+            apiErrors: 0
+        };
+
         this.dataApi = axios.create({
             baseURL: 'https://data-api.polymarket.com',
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Content-Type': 'application/json' },
+            timeout: this.apiTimeoutMs
         });
 
         this.gammaApi = axios.create({
-            baseURL: 'https://gamma-api.polymarket.com'
+            baseURL: 'https://gamma-api.polymarket.com',
+            timeout: this.apiTimeoutMs
         });
     }
 
     async start() {
         if (this.isScanning) return;
         this.isScanning = true;
-        
-        console.log(`[MarketWhaleTracker] Starting whale tracker. Threshold: $${this.threshold}`);
 
-        // Initial cache population (optional but good for context)
+        console.log(`[MarketWhaleTracker] Starting whale tracker. Threshold: $${this.threshold} | Poll: ${this.pollIntervalMs}ms | Page size: ${this.tradeFetchLimit}`);
+
         await this.updateTopMarketsCache();
-
-        // Start polling loop
-        this.pollTrades();
-        
-        // Schedule cache updates - every 10 minutes
-        setInterval(() => this.updateTopMarketsCache(), 10 * 60 * 1000);
+        void this.pollTrades();
+        setInterval(() => this.updateTopMarketsCache(), this.cacheRefreshMs);
+        setInterval(() => this.logStats(), this.statsLogIntervalMs);
     }
 
     async pollTrades() {
         if (!this.isScanning) return;
-
-        const POLL_INTERVAL = 2000; // 2 seconds (Safe: 5 req/10s vs Limit 200/10s)
-        
+        this.stats.polls++;
         try {
             await this.scanGlobalTrades();
         } catch (error) {
             console.error('[MarketWhaleTracker] Error in poll cycle:', error.message);
+            this.stats.apiErrors++;
         } finally {
-            setTimeout(() => this.pollTrades(), POLL_INTERVAL);
+            setTimeout(() => this.pollTrades(), this.pollIntervalMs);
         }
+    }
+
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    isRetryableError(error) {
+        const status = error?.response?.status;
+        return error?.code === 'ECONNABORTED' || status === 429 || (status >= 500 && status < 600);
+    }
+
+    getRetryDelayMs(attempt) {
+        const base = 250 * Math.pow(2, attempt);
+        const jitter = Math.floor(Math.random() * 150);
+        return base + jitter;
+    }
+
+    async requestWithRetry(apiClient, requestConfig, label) {
+        let attempt = 0;
+        while (attempt <= this.maxRetryAttempts) {
+            try {
+                return await apiClient.request(requestConfig);
+            } catch (error) {
+                const shouldRetry = attempt < this.maxRetryAttempts && this.isRetryableError(error);
+                if (!shouldRetry) {
+                    this.stats.apiErrors++;
+                    throw error;
+                }
+                const waitMs = this.getRetryDelayMs(attempt);
+                console.warn(`[MarketWhaleTracker] Retry ${label} in ${waitMs}ms (${attempt + 1}/${this.maxRetryAttempts})`);
+                await this.sleep(waitMs);
+                attempt++;
+            }
+        }
+        throw new Error(`[MarketWhaleTracker] Unreachable retry branch for ${label}`);
+    }
+
+    normalizeTradesResponse(payload) {
+        if (Array.isArray(payload)) return payload;
+        if (Array.isArray(payload?.trades)) return payload.trades;
+        if (Array.isArray(payload?.items)) return payload.items;
+        return [];
     }
 
     async updateTopMarketsCache() {
         try {
             console.log('[MarketWhaleTracker] Refreshing top market cache...');
-            
-            // Fetch top active events/markets to populate cache
-            const response = await this.gammaApi.get('/events', {
+
+            const response = await this.requestWithRetry(this.gammaApi, {
+                method: 'get',
+                url: '/events',
                 params: {
                     limit: 50, 
                     active: true,
@@ -70,7 +123,7 @@ class MarketWhaleTracker {
                     order: 'volume', 
                     ascending: false
                 }
-            });
+            }, 'gamma events');
 
             let count = 0;
             if (response.data && Array.isArray(response.data)) {
@@ -116,17 +169,33 @@ class MarketWhaleTracker {
 
     async scanGlobalTrades() {
         try {
-            // Fetch latest trades globally
-            const response = await this.dataApi.get('/trades', {
-                params: {
-                    limit: 100, // Max limit
-                    takerOnly: true
-                }
-            });
-
-            await this.processTrades(response.data);
+            let offset = 0;
+            let pagesFetched = 0;
+            let totalFetched = 0;
+            while (pagesFetched < this.maxPagesPerPoll && totalFetched < this.maxTradesPerPoll) {
+                const remaining = this.maxTradesPerPoll - totalFetched;
+                const pageSize = Math.max(1, Math.min(this.tradeFetchLimit, remaining));
+                const response = await this.requestWithRetry(this.dataApi, {
+                    method: 'get',
+                    url: '/trades',
+                    params: {
+                        limit: pageSize,
+                        takerOnly: true,
+                        offset
+                    }
+                }, 'data trades');
+                const batch = this.normalizeTradesResponse(response.data);
+                if (batch.length === 0) break;
+                this.stats.tradesFetched += batch.length;
+                totalFetched += batch.length;
+                pagesFetched++;
+                await this.processTrades(batch);
+                if (batch.length < pageSize) break;
+                offset += batch.length;
+            }
         } catch (error) {
             console.error('[MarketWhaleTracker] Global scan error:', error.message);
+            this.stats.apiErrors++;
         }
     }
 
@@ -134,39 +203,25 @@ class MarketWhaleTracker {
         if (!Array.isArray(trades)) return;
 
         const now = Date.now();
-        // We only care about trades in the last few seconds to avoid duplicate processing on restart
-        // But since we track IDs, we can be lenient.
         const MAX_AGE = 5 * 60 * 1000; 
-
-        // Filter and process
-        // We process from oldest to newest in the batch if we want to preserve order, 
-        // but the API returns newest first. Let's reverse to process chronologically.
-        const newTrades = trades.reverse().filter(trade => {
-            // 1. Check recency
-            const tradeTime = trade.timestamp * 1000;
+        const newTrades = trades.slice().reverse().filter(trade => {
+            const tradeTs = Number(trade.timestamp);
+            if (!Number.isFinite(tradeTs)) return false;
+            if (trade.side !== 'BUY') return false;
+            const tradeTime = tradeTs * 1000;
             if (now - tradeTime > MAX_AGE) return false;
-
-            // 2. Check if already processed
-            // Data API trades usually have 'match_id' or 'id'.
-            // Fallback to timestamp-maker-asset combo if needed.
-            const tradeId = trade.match_id || trade.id || `${trade.timestamp}-${trade.maker_address}-${trade.asset}`;
+            const tradeId = trade.match_id || trade.id || `${trade.timestamp}-${trade.maker_address}-${trade.asset}-${trade.side}`;
             
             if (this.processedTradeIds.has(tradeId)) return false;
-            
-            // Add to processed set
             this.processedTradeIds.add(tradeId);
-            
-            // Prune set if too large
             if (this.processedTradeIds.size > 10000) {
                 const it = this.processedTradeIds.values();
                 for (let i = 0; i < 2000; i++) this.processedTradeIds.delete(it.next().value);
             }
-
-            // 3. Check value threshold
             const price = parseFloat(trade.price);
             const size = parseFloat(trade.size);
+            if (!Number.isFinite(price) || !Number.isFinite(size)) return false;
             const value = price * size;
-            
             if (value < this.threshold) return false;
 
             return true;
@@ -174,8 +229,10 @@ class MarketWhaleTracker {
 
         if (newTrades.length > 0) {
             console.log(`[MarketWhaleTracker] Found ${newTrades.length} new whale trades.`);
-            for (const trade of newTrades) {
-                await this.postWhaleAlert(trade);
+            this.stats.candidates += newTrades.length;
+            for (let i = 0; i < newTrades.length; i += this.alertConcurrency) {
+                const chunk = newTrades.slice(i, i + this.alertConcurrency);
+                await Promise.all(chunk.map(trade => this.postWhaleAlert(trade)));
             }
         }
     }
@@ -188,28 +245,27 @@ class MarketWhaleTracker {
             const channel = await guild.channels.fetch(this.targetChannelId).catch(() => null);
             if (!channel) return;
 
-            const assetId = trade.asset || trade.asset_id; // Data API uses 'asset', sometimes 'asset_id'
-            
-            // Resolve Market Metadata
-            let marketTitle = trade.title || 'Unknown Market'; // Data API often provides title
+            const assetId = trade.asset || trade.asset_id;
+            let marketTitle = trade.title || 'Unknown Market';
             let marketImage = trade.icon || trade.image;
             let outcomeLabel = trade.outcome;
 
-            // Fallback to cache if Data API missing details
             if (!marketTitle || marketTitle === 'Unknown Market') {
                 const cached = this.marketCache.get(assetId);
                 if (cached) {
                     marketTitle = cached.title;
                     marketImage = marketImage || cached.image || cached.icon;
                 } else {
-                    // Last resort: Fetch on demand (Rate limited)
                     try {
-                        const marketRes = await this.gammaApi.get(`/markets`, { params: { asset_id: assetId } });
+                        const marketRes = await this.requestWithRetry(this.gammaApi, {
+                            method: 'get',
+                            url: '/markets',
+                            params: { asset_id: assetId }
+                        }, 'gamma market metadata');
                         if (marketRes.data?.[0]) {
                             const m = marketRes.data[0];
                             marketTitle = m.question;
                             marketImage = marketImage || m.image;
-                            // Update cache
                             this.marketCache.set(assetId, { 
                                 title: m.question, 
                                 image: m.image,
@@ -222,7 +278,6 @@ class MarketWhaleTracker {
                 }
             }
 
-            const isBuy = trade.side === 'BUY';
             const priceVal = parseFloat(trade.price);
             const sizeVal = parseFloat(trade.size);
             const valueVal = priceVal * sizeVal;
@@ -231,16 +286,13 @@ class MarketWhaleTracker {
             const sizeStr = sizeVal.toLocaleString(undefined, {maximumFractionDigits: 2});
             const valueStr = `$${valueVal.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
 
-            // Outcome formatting
             const outcomeText = outcomeLabel ? `(${outcomeLabel})` : '';
-            
-            // Time formatting (Discord Relative Timestamp)
-            const tradeTimestamp = Math.floor(trade.timestamp); // Ensure it's in seconds
-            const timeField = `<t:${tradeTimestamp}:R>`; // e.g. "2 minutes ago"
+            const tradeTimestamp = Math.floor(Number(trade.timestamp));
+            const timeField = Number.isFinite(tradeTimestamp) ? `<t:${tradeTimestamp}:R>` : 'Unknown';
 
             const embed = new EmbedBuilder()
                 .setTitle('🐋 WHALE ALERT')
-                .setDescription(`**${marketTitle}** ${outcomeText}\n\n**Whale ${isBuy ? 'Bought' : 'Sold'}**`)
+                .setDescription(`**${marketTitle}** ${outcomeText}\n\n**Whale Bought**`)
                 .setColor(0x00FFFF) // Cyan
                 .addFields(
                     { name: 'Price', value: priceStr, inline: true },
@@ -249,7 +301,7 @@ class MarketWhaleTracker {
                     { name: 'Time', value: timeField, inline: true }
                 )
                 .setFooter({ text: 'Polymarket Whale Alert • Powered by CordEx' })
-                .setTimestamp(new Date(trade.timestamp * 1000));
+                .setTimestamp(Number.isFinite(Number(trade.timestamp)) ? new Date(Number(trade.timestamp) * 1000) : new Date());
 
             if (marketImage) embed.setThumbnail(marketImage);
 
@@ -263,11 +315,17 @@ class MarketWhaleTracker {
                 );
 
             await channel.send({ embeds: [embed], components: [row] });
+            this.stats.alertsSent++;
             console.log(`[MarketWhaleTracker] Alert sent for ${valueStr} trade on ${marketTitle}`);
 
         } catch (error) {
             console.error('[MarketWhaleTracker] Error posting alert:', error.message);
+            this.stats.apiErrors++;
         }
+    }
+
+    logStats() {
+        console.log(`[MarketWhaleTracker] Stats | polls=${this.stats.polls} fetched=${this.stats.tradesFetched} candidates=${this.stats.candidates} alerts=${this.stats.alertsSent} errors=${this.stats.apiErrors}`);
     }
 }
 
