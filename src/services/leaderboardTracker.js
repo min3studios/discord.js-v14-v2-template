@@ -14,6 +14,7 @@ class LeaderboardTracker {
         this.targetGuildId = process.env.TARGET_GUILD_ID;
         this.targetChannelId = process.env.LEADERBOARD_CHANNEL_ID;
         this.leaderboardLimit = parseInt(process.env.LEADERBOARD_ACCOUNT_LIMIT || '50'); // Top N traders
+        this.threshold = parseFloat(process.env.LEADERBOARD_ALERT_THRESHOLD || '50'); // Value threshold
 
         // Cache for market metadata (AssetID -> { title, image, ... })
         this.marketCache = new Map();
@@ -27,6 +28,9 @@ class LeaderboardTracker {
         this.gammaApi = axios.create({
             baseURL: 'https://gamma-api.polymarket.com'
         });
+
+        // Round-robin index for polling specific users
+        this.userPollIndex = 0;
     }
 
     async start() {
@@ -50,10 +54,14 @@ class LeaderboardTracker {
     async pollTrades() {
         if (!this.isScanning) return;
 
-        const POLL_INTERVAL = 1000; // 1 second - Fast polling
+        // Poll Strategy:
+        // We will cycle through our top traders and fetch their recent activity directly.
+        // This guarantees we don't miss trades that might fall off the global feed.
+        
+        const POLL_INTERVAL = 2000; // 2 seconds per batch
         
         try {
-            await this.scanGlobalTrades();
+            await this.scanSpecificTraders();
         } catch (error) {
             console.error('[LeaderboardTracker] Error in poll cycle:', error.message);
         } finally {
@@ -64,49 +72,26 @@ class LeaderboardTracker {
     async updateTopMarketsCache() {
         try {
             console.log('[LeaderboardTracker] Refreshing top market cache...');
-            
-            // Fetch top active events/markets to populate cache
             const response = await this.gammaApi.get('/events', {
-                params: {
-                    limit: 50, 
-                    active: true,
-                    closed: false,
-                    order: 'volume', 
-                    ascending: false
-                }
+                params: { limit: 50, active: true, closed: false, order: 'volume', ascending: false }
             });
 
-            let count = 0;
             if (response.data && Array.isArray(response.data)) {
                 for (const event of response.data) {
                     if (event.markets && Array.isArray(event.markets)) {
                         for (const market of event.markets) {
-                            // Extract metadata
                             const metadata = {
                                 title: market.question,
                                 slug: market.slug,
                                 image: market.image || (event.image ? event.image : null),
                                 icon: market.icon || (event.icon ? event.icon : null)
                             };
-
-                            // Map all asset IDs (clobTokenIds) to this metadata
+                            if (market.asset_id) this.marketCache.set(market.asset_id, metadata);
                             if (market.clobTokenIds) {
                                 try {
-                                    const tokenIds = JSON.parse(market.clobTokenIds);
-                                    if (Array.isArray(tokenIds)) {
-                                        tokenIds.forEach(id => this.marketCache.set(id, metadata));
-                                        count++;
-                                    }
-                                } catch (e) {
-                                    if (Array.isArray(market.clobTokenIds)) {
-                                        market.clobTokenIds.forEach(id => this.marketCache.set(id, metadata));
-                                        count++;
-                                    }
-                                }
-                            }
-                            if (market.asset_id) {
-                                this.marketCache.set(market.asset_id, metadata);
-                                count++;
+                                    const ids = JSON.parse(market.clobTokenIds);
+                                    if (Array.isArray(ids)) ids.forEach(id => this.marketCache.set(id, metadata));
+                                } catch (e) { /* ignore */ }
                             }
                         }
                     }
@@ -122,12 +107,7 @@ class LeaderboardTracker {
         try {
             console.log('[LeaderboardTracker] Refreshing top traders leaderboard...');
             const response = await this.dataApi.get('/v1/leaderboard', {
-                params: {
-                    category: 'OVERALL',
-                    timePeriod: 'DAY',
-                    orderBy: 'PNL',
-                    limit: this.leaderboardLimit
-                }
+                params: { category: 'OVERALL', timePeriod: 'DAY', orderBy: 'PNL', limit: this.leaderboardLimit }
             });
 
             if (response.data && Array.isArray(response.data)) {
@@ -139,83 +119,99 @@ class LeaderboardTracker {
                         username: trader.userName || trader.xUsername || 'Unknown',
                         address: trader.proxyWallet || trader.user
                     };
-
-                    if (trader.proxyWallet) {
-                        this.topTraders.set(trader.proxyWallet.toLowerCase(), info);
-                    }
-                    if (trader.user) {
-                        this.topTraders.set(trader.user.toLowerCase(), info);
-                    }
+                    // Store by address for easy lookup
+                    if (trader.proxyWallet) this.topTraders.set(trader.proxyWallet.toLowerCase(), info);
+                    else if (trader.user) this.topTraders.set(trader.user.toLowerCase(), info);
                 });
                 console.log(`[LeaderboardTracker] Updated top traders list. Count: ${this.topTraders.size}`);
+                // Reset poll index if list changed significantly or just for safety
+                if (this.userPollIndex >= this.topTraders.size) this.userPollIndex = 0;
             }
         } catch (error) {
             console.error('[LeaderboardTracker] Error fetching leaderboard:', error.message);
         }
     }
 
-    async scanGlobalTrades() {
-        try {
-            // Fetch latest trades globally
-            const response = await this.dataApi.get('/trades', {
-                params: {
-                    limit: 100, // Max limit
-                    takerOnly: true
-                }
-            });
+    async scanSpecificTraders() {
+        if (this.topTraders.size === 0) return;
 
-            await this.processTrades(response.data);
-        } catch (error) {
-            console.error('[LeaderboardTracker] Global scan error:', error.message);
+        const traders = Array.from(this.topTraders.values());
+        const BATCH_SIZE = 5; // Check 5 traders per interval
+        
+        // Get next batch of traders to check
+        const batch = [];
+        for (let i = 0; i < BATCH_SIZE; i++) {
+            if (this.userPollIndex >= traders.length) this.userPollIndex = 0;
+            batch.push(traders[this.userPollIndex]);
+            this.userPollIndex++;
         }
+
+        // Process batch in parallel
+        await Promise.all(batch.map(async (trader) => {
+            try {
+                // Use /activity endpoint as suggested by docs for user activity
+                // Or /trades?user=ADDRESS. Let's use /trades for consistency with structure.
+                const response = await this.dataApi.get('/trades', {
+                    params: {
+                        user: trader.address,
+                        limit: 5, // Only need very recent ones
+                        takerOnly: false // See ALL trades (Maker & Taker)
+                    }
+                });
+                
+                await this.processTrades(response.data, trader);
+            } catch (err) {
+                // Ignore errors for individual users (e.g. 404 or rate limit glitches)
+                // console.warn(`[LeaderboardTracker] Failed to scan ${trader.username}: ${err.message}`);
+            }
+        }));
     }
 
-    async processTrades(trades) {
+    async processTrades(trades, knownTraderInfo = null) {
         if (!Array.isArray(trades)) return;
 
         const now = Date.now();
-        const MAX_AGE = 5 * 60 * 1000; // 5 minutes
+        const MAX_AGE = 2 * 60 * 1000; // 2 minutes window
 
-        // Filter and process
+        // Filter valid new trades
         const newTrades = trades.reverse().filter(trade => {
-            // 1. Check recency
             const tradeTime = trade.timestamp * 1000;
             if (now - tradeTime > MAX_AGE) return false;
 
-            // 2. Check if already processed
+            // Value filter
+            const value = parseFloat(trade.price) * parseFloat(trade.size);
+            if (value < this.threshold) return false;
+
             const tradeId = trade.match_id || trade.id || `${trade.timestamp}-${trade.maker_address}-${trade.asset}`;
-            
             if (this.processedTradeIds.has(tradeId)) return false;
             
-            // Add to processed set
             this.processedTradeIds.add(tradeId);
-            
-            // Prune set if too large
             if (this.processedTradeIds.size > 10000) {
                 const it = this.processedTradeIds.values();
                 for (let i = 0; i < 2000; i++) this.processedTradeIds.delete(it.next().value);
             }
-
-            // 3. Check if trade involves a top trader
-            const maker = trade.maker_address ? trade.maker_address.toLowerCase() : '';
-            const taker = trade.taker_address ? trade.taker_address.toLowerCase() : '';
-            
-            return this.topTraders.has(maker) || this.topTraders.has(taker);
+            return true;
         });
 
         if (newTrades.length > 0) {
-            console.log(`[LeaderboardTracker] Found ${newTrades.length} new top trader trades.`);
+            console.log(`[LeaderboardTracker] Found ${newTrades.length} new trades for monitored users.`);
             for (const trade of newTrades) {
-                // Determine who is the top trader
-                const maker = trade.maker_address ? trade.maker_address.toLowerCase() : '';
-                const taker = trade.taker_address ? trade.taker_address.toLowerCase() : '';
-                
-                let traderInfo = this.topTraders.get(taker);
-                let role = 'Taker'; // Default to Taker if both match or just Taker matches
-                
+                // If we called this from scanSpecificTraders, we know who it is.
+                // Otherwise (if we reused global scan), we'd lookup.
+                let traderInfo = knownTraderInfo;
+                let role = 'Trader'; 
+
                 if (!traderInfo) {
-                    traderInfo = this.topTraders.get(maker);
-                    role = 'Maker';
+                    // Fallback lookup
+                    const maker = trade.maker_address ? trade.maker_address.toLowerCase() : '';
+                    const taker = trade.taker_address ? trade.taker_address.toLowerCase() : '';
+                    traderInfo = this.topTraders.get(taker) || this.topTraders.get(maker);
+                    if (this.topTraders.has(maker)) role = 'Maker';
+                    if (this.topTraders.has(taker)) role = 'Taker';
+                } else {
+                    // Determine role if possible
+                    if (trade.maker_address && trade.maker_address.toLowerCase() === traderInfo.address.toLowerCase()) role = 'Maker';
+                    else if (trade.taker_address && trade.taker_address.toLowerCase() === traderInfo.address.toLowerCase()) role = 'Taker';
                 }
 
                 if (traderInfo) {
@@ -239,26 +235,23 @@ class LeaderboardTracker {
             let marketTitle = trade.title || 'Unknown Market';
             let marketImage = trade.icon || trade.image;
             let outcomeLabel = trade.outcome;
+            let marketSlug = trade.eventSlug || trade.slug;
 
-            // Fallback to cache
             if (!marketTitle || marketTitle === 'Unknown Market') {
                 const cached = this.marketCache.get(assetId);
                 if (cached) {
                     marketTitle = cached.title;
                     marketImage = marketImage || cached.image || cached.icon;
+                    marketSlug = cached.slug;
                 } else {
-                    // Last resort: Fetch on demand
                     try {
                         const marketRes = await this.gammaApi.get(`/markets`, { params: { asset_id: assetId } });
                         if (marketRes.data?.[0]) {
                             const m = marketRes.data[0];
                             marketTitle = m.question;
                             marketImage = marketImage || m.image;
-                            this.marketCache.set(assetId, { 
-                                title: m.question, 
-                                image: m.image,
-                                slug: m.slug 
-                            });
+                            marketSlug = m.slug;
+                            this.marketCache.set(assetId, { title: m.question, image: m.image, slug: m.slug });
                         }
                     } catch (e) {
                         console.warn(`[LeaderboardTracker] Failed to fetch metadata for ${assetId}`);
@@ -275,12 +268,10 @@ class LeaderboardTracker {
             const sizeStr = sizeVal.toLocaleString(undefined, {maximumFractionDigits: 2});
             const valueStr = `$${valueVal.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
             
-            // Format Trader Info
             const traderName = traderInfo.username !== 'Unknown' ? traderInfo.username : `${traderInfo.address.slice(0,6)}...`;
             const pnlStr = traderInfo.pnl >= 0 ? `+$${traderInfo.pnl.toLocaleString()}` : `-$${Math.abs(traderInfo.pnl).toLocaleString()}`;
             const outcomeText = outcomeLabel ? `(${outcomeLabel})` : '';
             
-            // Discord Relative Timestamp
             const tradeTimestamp = Math.floor(trade.timestamp); 
             const timeField = `<t:${tradeTimestamp}:R>`; 
 
@@ -304,8 +295,12 @@ class LeaderboardTracker {
                     new ButtonBuilder()
                         .setCustomId('copy_trade')
                         .setLabel('Copy Trade')
-                        .setStyle(ButtonStyle.Primary)
-                        .setEmoji('📈')
+                        .setStyle(ButtonStyle.Success)
+                        .setEmoji('📈'),
+                    new ButtonBuilder()
+                        .setLabel('View on Polymarket') 
+                        .setStyle(ButtonStyle.Link)
+                        .setURL(`https://polymarket.com/event/${marketSlug || ''}`)
                 );
 
             await channel.send({ embeds: [embed], components: [row] });
